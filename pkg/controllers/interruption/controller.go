@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	sqsapi "github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/awslabs/operatorpkg/singleton"
 	"go.uber.org/multierr"
@@ -64,6 +65,7 @@ type Controller struct {
 	clk                       clock.Clock
 	recorder                  events.Recorder
 	sqsProvider               sqs.Provider
+	sqsAPI                    *sqsapi.Client
 	unavailableOfferingsCache *cache.UnavailableOfferings
 	parser                    *EventParser
 	cm                        *pretty.ChangeMonitor
@@ -75,6 +77,7 @@ func NewController(
 	clk clock.Clock,
 	recorder events.Recorder,
 	sqsProvider sqs.Provider,
+	sqsAPI *sqsapi.Client,
 	unavailableOfferingsCache *cache.UnavailableOfferings,
 ) *Controller {
 	return &Controller{
@@ -83,6 +86,7 @@ func NewController(
 		clk:                       clk,
 		recorder:                  recorder,
 		sqsProvider:               sqsProvider,
+		sqsAPI:                    sqsAPI,
 		unavailableOfferingsCache: unavailableOfferingsCache,
 		parser:                    NewEventParser(DefaultParsers...),
 		cm:                        pretty.NewChangeMonitor(),
@@ -91,6 +95,14 @@ func NewController(
 
 func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, "interruption")
+	if c.sqsProvider == nil {
+		prov, err := sqs.NewSQSProvider(ctx, c.sqsAPI)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to create valid sqs provider")
+			return reconcile.Result{}, fmt.Errorf("creating sqs provider, %w", err)
+		}
+		c.sqsProvider = prov
+	}
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("queue", c.sqsProvider.Name()))
 	if c.cm.HasChanged(c.sqsProvider.Name(), nil) {
 		log.FromContext(ctx).V(1).Info("watching interruption queue")
@@ -108,7 +120,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
 		msg, e := c.parseMessage(sqsMessages[i])
 		if e != nil {
 			// If we fail to parse, then we should delete the message but still log the error
-			log.FromContext(ctx).Error(err, "failed parsing interruption message")
+			log.FromContext(ctx).Error(e, "failed parsing interruption message")
 			errs[i] = c.deleteMessage(ctx, sqsMessages[i])
 			return
 		}
@@ -195,9 +207,9 @@ func (c *Controller) deleteMessage(ctx context.Context, msg *sqstypes.Message) e
 // handleNodeClaim retrieves the action for the message and then performs the appropriate action against the node
 func (c *Controller) handleNodeClaim(ctx context.Context, msg messages.Message, nodeClaim *karpv1.NodeClaim, node *corev1.Node) error {
 	action := actionForMessage(msg)
-	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("NodeClaim", klog.KRef("", nodeClaim.Name), "action", string(action)))
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nodeClaim), "action", string(action)))
 	if node != nil {
-		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KRef("", node.Name)))
+		ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("Node", klog.KObj(node)))
 	}
 
 	// Record metric and event for this action
